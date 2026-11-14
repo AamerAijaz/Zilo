@@ -39,6 +39,8 @@ pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwMaximumWindowSize: windows.COORD,
 };
 
+var zilo_version: []const u8 = "0.0.1";
+
 /// disables canonical mode.
 var enable_line_input: u32 = 0x0002;
 /// When enabled, the console copies characters read from
@@ -159,43 +161,59 @@ pub const Editor = struct {
         };
     }
 
-    pub fn refreshScreen(self: *Editor, allocator: std.mem.Allocator, quitting: bool) !void {
-        const buffer = try allocator.alloc(u8, 1024);
-        defer allocator.free(buffer);
+    pub fn refreshScreen(self: *Editor, quitting: bool) !void {
+        // Hide the cursor.
+        _ = try self.writer.write("\x1b[?25l");
 
-        var fw = std.Io.Writer.fixed(buffer);
-
-        // Clear the visible window.
-        _ = try fw.write("\x1b[2J");
+        if (quitting) {
+            _ = try self.writer.write("\x1b[2J");
+        }
 
         // Position the cursor at the first column and row.
-        _ = try fw.write("\x1b[H");
+        _ = try self.writer.write("\x1b[H");
 
         // Wipe the scroll back buffer, i.e the history above visible window.
-        _ = try fw.write("\x1b[3J");
+        _ = try self.writer.write("\x1b[3J");
 
-        if (!quitting) try self.drawRows(&fw);
-        _ = try fw.write("\x1b[H");
+        if (!quitting) try self.drawRows();
+        _ = try self.writer.write("\x1b[H");
 
-        _ = try self.writer.write(fw.buffered());
+        // Unhide the cursor
+        _ = try self.writer.write("\x1b[?25h");
+
+        try self.writer.flush();
     }
 
-    pub fn drawRows(self: *Editor, writer: ?*std.Io.Writer) !void {
-        var w = if (writer == null) self.writer else writer.?;
+    pub fn drawRows(self: *Editor) !void {
+        for (0..self.rows) |i| {
+            if (i == self.rows / 3) {
+                var buf: [64]u8 = undefined;
+                const written = try std.mem.print(&buf, "Zilo editor -- version {s}", .{zilo_version});
 
-        _ = try w.write("\r\n");
-        for (1..self.rows - 1) |_| {
-            _ = try w.write("~\r\n");
+                for (0..(self.cols - written.len) / 2) |_| {
+                    _ = try self.writer.write(" ");
+                }
+
+                _ = try self.writer.write(written);
+            } else {
+                _ = try self.writer.write("~");
+            }
+
+            // Clear the line after the current position.
+            _ = try self.writer.write("\x1b[K");
+
+            if (i < self.rows - 1) {
+                _ = try self.writer.write("\r\n");
+            }
         }
     }
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
-
-    var buffer: [1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(init.io, &buffer);
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &.{});
+    var read_buffer: [1024]u8 = undefined;
+    var write_buffer: [1024]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(init.io, &read_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &write_buffer);
 
     var editor = Editor.init(&stdin_reader.interface, &stdout_writer.interface) catch |err| {
         std.debug.print("ERROR: Unable to initialize editor: {any}\r\n", .{err});
@@ -206,13 +224,13 @@ pub fn main(init: std.process.Init) !void {
     try editor.enableRawMode();
 
     while (true) {
-        editor.refreshScreen(allocator, false) catch |err| {
+        editor.refreshScreen(false) catch |err| {
             std.debug.print("ERROR: Refreshing screen: {any}\r\n", .{err});
         };
 
         editor.processKeypress() catch |err| switch (err) {
             EditorError.ExitKeyPressed => {
-                try editor.refreshScreen(allocator, true);
+                try editor.refreshScreen(true);
                 break;
             },
             else => std.debug.print("ERROR: Reading byte from terminal: {any}\r\n", .{err}),
