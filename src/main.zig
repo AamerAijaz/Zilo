@@ -57,6 +57,18 @@ var enable_virtual_terminal_input: u32 = 0x0200;
 var enable_virtual_terminal_processing: u32 = 0x0004;
 var disable_newline_auto_return: u32 = 0x0008;
 
+pub const EditorKey = enum {
+    ARROW_UP,
+    ARROW_DOWN,
+    ARROW_RIGHT,
+    ARROW_LEFT,
+    PAGE_UP,
+    PAGE_DOWN,
+    HOME,
+    END,
+    DEL,
+};
+
 pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
 pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
 pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
@@ -157,46 +169,100 @@ pub const Editor = struct {
         }
     }
 
-    pub fn readKey(self: *Editor) !u8 {
+    pub fn readKey(self: *Editor) !union(enum){ key: EditorKey, value: u8 } {
         const value = try self.reader.takeByte();
 
-        // If the value read is an escape sequence.
-        if (value == '\x1b') {
-            const sequence = try self.reader.takeArray(2);
-            if (sequence[0] == '[') {
-                return switch (sequence[1]) {
-                    'A' => 'w',
-                    'B' => 's',
-                    'C' => 'd',
-                    'D' => 'a',
-                    else => '\x1b'
+        return switch (value) {
+            '\x1b' => {
+                const seq0 = try self.reader.takeByte();
+                return switch (seq0) {
+                    '[' => {
+                        const seq1 = try self.reader.takeByte();
+                        return switch (seq1) {
+                            '0'...'9' => {
+                                const seq2 = try self.reader.takeByte();
+                                if (seq2 == '~') {
+                                    return switch (seq1) {
+                                        '1' => .{ .key = EditorKey.HOME },
+                                        '3' => .{ .key = EditorKey.DEL },
+                                        '4' => .{ .key = EditorKey.END },
+                                        '5' => .{ .key = EditorKey.PAGE_UP },
+                                        '6' => .{ .key = EditorKey.PAGE_DOWN },
+                                        '7' => .{ .key = EditorKey.HOME },
+                                        '8' => .{ .key = EditorKey.END },
+                                        else => .{ .value = '\x1b' },
+                                    };
+                                }
+                                return .{ .value = '\x1b' };
+                            },
+                            'A' => .{ .key = EditorKey.ARROW_UP },
+                            'B' => .{ .key = EditorKey.ARROW_DOWN },
+                            'C' => .{ .key = EditorKey.ARROW_RIGHT },
+                            'D' => .{ .key = EditorKey.ARROW_LEFT },
+                            'H' => .{ .key = EditorKey.HOME },
+                            'F' => .{ .key = EditorKey.END },
+                            else => .{ .value = '\x1b' },
+                        };
+                    },
+                    'O' => {
+                        const seq1 = try self.reader.takeByte();
+                        return switch (seq1) {
+                            'H' => .{ .key = EditorKey.HOME },
+                            'F' => .{ .key = EditorKey.END },
+                            else => .{ .value = '\x1b' },
+                        };
+                    },
+                    else => .{ .value = '\x1b' },
                 };
-            }
-            return '\x1b';
-        }
-
-        return value;
+            },
+            'w' => .{ .key = EditorKey.ARROW_UP },
+            's' => .{ .key = EditorKey.ARROW_DOWN },
+            'a' => .{ .key = EditorKey.ARROW_LEFT },
+            'd' => .{ .key = EditorKey.ARROW_RIGHT },
+            else => .{ .value = value },
+        };
     }
 
     pub fn processKeypress(self: *Editor) !void {
         const value = try self.readKey();
         return switch (value) {
-            controlKey('q') => {
-                return EditorError.ExitKeyPressed;
+            .key => {
+                return switch (value.key) {
+                    EditorKey.ARROW_LEFT => {
+                        if (self.cursor.x > 0)  self.cursor.x -= 1;
+                    },
+                    EditorKey.ARROW_RIGHT => {
+                        if (self.cursor.x < self.cols)  self.cursor.x += 1;
+                    },
+                    EditorKey.ARROW_UP => {
+                        if (self.cursor.y > 0)  self.cursor.y -= 1;
+                    },
+                    EditorKey.ARROW_DOWN => {
+                        if (self.cursor.y < self.rows)  self.cursor.y += 1;
+                    },
+                    EditorKey.PAGE_UP => {
+                        self.cursor.y = 0;
+                    },
+                    EditorKey.PAGE_DOWN => {
+                        self.cursor.y = self.rows - 1;
+                    },
+                    EditorKey.HOME => {
+                        self.cursor.x = 0;
+                    },
+                    EditorKey.END => {
+                        self.cursor.x = self.cols - 1;
+                    },
+                    EditorKey.DEL => {},
+                };
+
             },
-            'a' => {
-                if (self.cursor.x > 0)  self.cursor.x -= 1;
-            },
-            'd' => {
-                if (self.cursor.x < self.cols)  self.cursor.x += 1;
-            },
-            'w' => {
-                if (self.cursor.y > 0)  self.cursor.y -= 1;
-            },
-            's' => {
-                if (self.cursor.y < self.rows)  self.cursor.y += 1;
-            },
-            else => {},
+            .value => {
+                return switch (value.value) {
+                    controlKey('q') => EditorError.ExitKeyPressed,
+
+                    else => {},
+                };
+            }
         };
     }
 
