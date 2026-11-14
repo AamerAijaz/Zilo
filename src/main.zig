@@ -78,7 +78,10 @@ pub const Editor = struct {
     writer: *std.Io.Writer,
     rows: u8,
     cols: u8,
-    append_buffer: []u8 = undefined,
+    cursor: struct {
+        x: u8,
+        y: u8,
+    },
 
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) !Editor {
         const stdin = std.Io.File.stdin();
@@ -112,7 +115,10 @@ pub const Editor = struct {
             },
             .rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
             .cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
-            .append_buffer = undefined,
+            .cursor = .{
+                .x = 0,
+                .y = 0,
+            }
         };
     }
 
@@ -151,23 +157,52 @@ pub const Editor = struct {
         }
     }
 
-    pub fn processKeypress(self: *Editor) !void {
+    pub fn readKey(self: *Editor) !u8 {
         const value = try self.reader.takeByte();
+
+        // If the value read is an escape sequence.
+        if (value == '\x1b') {
+            const sequence = try self.reader.takeArray(2);
+            if (sequence[0] == '[') {
+                return switch (sequence[1]) {
+                    'A' => 'w',
+                    'B' => 's',
+                    'C' => 'd',
+                    'D' => 'a',
+                    else => '\x1b'
+                };
+            }
+            return '\x1b';
+        }
+
+        return value;
+    }
+
+    pub fn processKeypress(self: *Editor) !void {
+        const value = try self.readKey();
         return switch (value) {
             controlKey('q') => {
                 return EditorError.ExitKeyPressed;
+            },
+            'a' => {
+                if (self.cursor.x > 0)  self.cursor.x -= 1;
+            },
+            'd' => {
+                if (self.cursor.x < self.cols)  self.cursor.x += 1;
+            },
+            'w' => {
+                if (self.cursor.y > 0)  self.cursor.y -= 1;
+            },
+            's' => {
+                if (self.cursor.y < self.rows)  self.cursor.y += 1;
             },
             else => {},
         };
     }
 
-    pub fn refreshScreen(self: *Editor, quitting: bool) !void {
+    pub fn refreshScreen(self: *Editor) !void {
         // Hide the cursor.
         _ = try self.writer.write("\x1b[?25l");
-
-        if (quitting) {
-            _ = try self.writer.write("\x1b[2J");
-        }
 
         // Position the cursor at the first column and row.
         _ = try self.writer.write("\x1b[H");
@@ -175,8 +210,8 @@ pub const Editor = struct {
         // Wipe the scroll back buffer, i.e the history above visible window.
         _ = try self.writer.write("\x1b[3J");
 
-        if (!quitting) try self.drawRows();
-        _ = try self.writer.write("\x1b[H");
+        try self.drawRows();
+        _ = try self.writer.print("\x1b[{d};{d}H", .{self.cursor.y + 1, self.cursor.x + 1});
 
         // Unhide the cursor
         _ = try self.writer.write("\x1b[?25h");
@@ -224,13 +259,16 @@ pub fn main(init: std.process.Init) !void {
     try editor.enableRawMode();
 
     while (true) {
-        editor.refreshScreen(false) catch |err| {
+        editor.refreshScreen() catch |err| {
             std.debug.print("ERROR: Refreshing screen: {any}\r\n", .{err});
         };
 
         editor.processKeypress() catch |err| switch (err) {
             EditorError.ExitKeyPressed => {
-                try editor.refreshScreen(true);
+                _ = try editor.writer.write("\x1b[2J");
+                _ = try editor.writer.write("\x1b[H");
+                _ = try editor.writer.write("\x1b[3J");
+                try editor.writer.flush();
                 break;
             },
             else => std.debug.print("ERROR: Reading byte from terminal: {any}\r\n", .{err}),
