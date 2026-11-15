@@ -5,6 +5,11 @@ const EditorError = error{
     ExitKeyPressed,
 };
 
+const EditorMode = enum {
+    Insert,
+    Normal,
+};
+
 pub const SMALL_RECT = extern struct {
     Left: i16,
     Top: i16,
@@ -67,6 +72,7 @@ pub const EditorKey = enum {
     HOME,
     END,
     DEL,
+    MODE_CHANGE,
 };
 
 pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
@@ -80,6 +86,10 @@ pub fn controlKey(c: u8) u8 {
     return c & std.ascii.control_code.us;
 }
 
+pub const Row = struct {
+    buffer: []u8,
+};
+
 pub const Editor = struct {
     console: struct {
         initial_input_mode: windows.DWORD = 0,
@@ -88,12 +98,13 @@ pub const Editor = struct {
     },
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
-    rows: u8,
-    cols: u8,
+    terminal_rows: u8, // Number of rows the terminal currently has.
+    terminal_cols: u8, // Number of columns the terminal currently has.
     cursor: struct {
         x: u8,
         y: u8,
     },
+    mode: EditorMode,
 
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) !Editor {
         const stdin = std.Io.File.stdin();
@@ -125,12 +136,13 @@ pub const Editor = struct {
                 .initial_output_mode = output_mode,
                 .console_screen_buffer_info = csbi,
             },
-            .rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
-            .cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+            .terminal_rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
+            .terminal_cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
             .cursor = .{
                 .x = 0,
                 .y = 0,
-            }
+            },
+            .mode = EditorMode.Normal,
         };
     }
 
@@ -169,7 +181,7 @@ pub const Editor = struct {
         }
     }
 
-    pub fn readKey(self: *Editor) !union(enum){ key: EditorKey, value: u8 } {
+    pub fn readKey(self: *Editor) !union(enum) { key: EditorKey, value: u8 } {
         const value = try self.reader.takeByte();
 
         return switch (value) {
@@ -212,13 +224,26 @@ pub const Editor = struct {
                             else => .{ .value = '\x1b' },
                         };
                     },
-                    else => .{ .value = '\x1b' },
+                    'n' => {
+                        if (self.mode != EditorMode.Normal) {
+                            return .{ .key = EditorKey.MODE_CHANGE };
+                        } else {
+                            return .{ .value = '\x1b' };
+                        }
+                    },
+                    else => {
+                        return .{ .value = '\x1b' };
+                    },
                 };
             },
             'w' => .{ .key = EditorKey.ARROW_UP },
             's' => .{ .key = EditorKey.ARROW_DOWN },
             'a' => .{ .key = EditorKey.ARROW_LEFT },
             'd' => .{ .key = EditorKey.ARROW_RIGHT },
+            'i' => {
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.MODE_CHANGE };
+                return .{ .value = value };
+            },
             else => .{ .value = value },
         };
     }
@@ -229,40 +254,47 @@ pub const Editor = struct {
             .key => {
                 return switch (value.key) {
                     EditorKey.ARROW_LEFT => {
-                        if (self.cursor.x > 0)  self.cursor.x -= 1;
+                        if (self.cursor.x > 0) self.cursor.x -= 1;
                     },
                     EditorKey.ARROW_RIGHT => {
-                        if (self.cursor.x < self.cols)  self.cursor.x += 1;
+                        if (self.cursor.x < self.terminal_cols) self.cursor.x += 1;
                     },
                     EditorKey.ARROW_UP => {
-                        if (self.cursor.y > 0)  self.cursor.y -= 1;
+                        if (self.cursor.y > 0) self.cursor.y -= 1;
                     },
                     EditorKey.ARROW_DOWN => {
-                        if (self.cursor.y < self.rows)  self.cursor.y += 1;
+                        if (self.cursor.y < self.terminal_rows) self.cursor.y += 1;
                     },
                     EditorKey.PAGE_UP => {
                         self.cursor.y = 0;
                     },
                     EditorKey.PAGE_DOWN => {
-                        self.cursor.y = self.rows - 1;
+                        self.cursor.y = self.terminal_rows - 1;
                     },
                     EditorKey.HOME => {
                         self.cursor.x = 0;
                     },
                     EditorKey.END => {
-                        self.cursor.x = self.cols - 1;
+                        self.cursor.x = self.terminal_cols - 1;
+                    },
+                    EditorKey.MODE_CHANGE => {
+                        if (self.mode == EditorMode.Normal) {
+                            self.mode = EditorMode.Insert;
+                        } else {
+                            self.mode = EditorMode.Normal;
+                        }
                     },
                     EditorKey.DEL => {},
                 };
-
             },
             .value => {
                 return switch (value.value) {
                     controlKey('q') => EditorError.ExitKeyPressed,
-
-                    else => {},
+                    else => {
+                        if (self.mode == EditorMode.Normal) return;
+                    },
                 };
-            }
+            },
         };
     }
 
@@ -277,7 +309,7 @@ pub const Editor = struct {
         _ = try self.writer.write("\x1b[3J");
 
         try self.drawRows();
-        _ = try self.writer.print("\x1b[{d};{d}H", .{self.cursor.y + 1, self.cursor.x + 1});
+        _ = try self.writer.print("\x1b[{d};{d}H", .{ self.cursor.y + 1, self.cursor.x + 1 });
 
         // Unhide the cursor
         _ = try self.writer.write("\x1b[?25h");
@@ -286,26 +318,20 @@ pub const Editor = struct {
     }
 
     pub fn drawRows(self: *Editor) !void {
-        for (0..self.rows) |i| {
-            if (i == self.rows / 3) {
-                var buf: [64]u8 = undefined;
-                const written = try std.mem.print(&buf, "Zilo editor -- version {s}", .{zilo_version});
-
-                for (0..(self.cols - written.len) / 2) |_| {
-                    _ = try self.writer.write(" ");
-                }
-
-                _ = try self.writer.write(written);
-            } else {
+        _ = try self.writer.write("\x1b[K");
+        for (0..self.terminal_rows) |i| {
+            if (i < self.terminal_rows - 1) {
                 _ = try self.writer.write("~");
+                _ = try self.writer.write("\r\n");
+            } else {
+                const mode = switch (self.mode) {
+                    EditorMode.Insert => "---- INSERT ----",
+                    EditorMode.Normal => "---- NORMAL ----",
+                };
+                _ = try self.writer.write(mode);
             }
-
             // Clear the line after the current position.
             _ = try self.writer.write("\x1b[K");
-
-            if (i < self.rows - 1) {
-                _ = try self.writer.write("\r\n");
-            }
         }
     }
 };
