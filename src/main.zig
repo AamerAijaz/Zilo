@@ -79,6 +79,7 @@ pub const EditorKey = enum {
 pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
 pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
 pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
 
 /// Returns the control key for that character.
 ///
@@ -194,13 +195,30 @@ pub const Editor = struct {
         }
     }
 
+    pub fn readTimeout(self: *Editor, timeout: u32) !?u8 {
+        const stdin_handle = std.Io.File.stdin().handle;
+        const WAIT_OBJECT_0: u32 = 0;
+        if (WaitForSingleObject(stdin_handle, timeout) == WAIT_OBJECT_0) {
+            return try self.reader.takeByte();
+        }
+        return null;
+    }
+
     pub fn readKey(self: *Editor) !union(enum) { key: EditorKey, value: u8 } {
         const value = try self.reader.takeByte();
 
         return switch (value) {
             '\x1b' => {
-                const seq0 = try self.reader.takeByte();
-                return switch (seq0) {
+                const seq0 = try self.readTimeout(50);
+                if (seq0 == null) {
+                    if (self.mode != EditorMode.Normal) {
+                        return .{ .key = EditorKey.MODE_CHANGE };
+                    } else {
+                        return .{ .value = value };
+                    }
+                }
+
+                return switch (seq0.?) {
                     '[' => {
                         const seq1 = try self.reader.takeByte();
                         return switch (seq1) {
@@ -237,13 +255,6 @@ pub const Editor = struct {
                             else => .{ .value = value },
                         };
                     },
-                    'n' => {
-                        if (self.mode != EditorMode.Normal) {
-                            return .{ .key = EditorKey.MODE_CHANGE };
-                        } else {
-                            return .{ .value = value };
-                        }
-                    },
                     else => {
                         return .{ .value = value };
                     },
@@ -271,7 +282,7 @@ pub const Editor = struct {
             },
             '\r' => {
                 if (self.mode == EditorMode.Insert) {
-                    const seq0 = try self.reader.takeByte();
+                    const seq0 = try self.readTimeout(50);
                     if (seq0 == '\n') {
                         return .{ .key = EditorKey.ENTER };
                     }
