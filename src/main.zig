@@ -1,22 +1,7 @@
 const std = @import("std");
 const windows = std.os.windows;
 
-const EditorError = error{
-    ExitKeyPressed,
-};
-
-const EditorMode = enum {
-    Insert,
-    Normal,
-};
-
-pub const SMALL_RECT = extern struct {
-    Left: i16,
-    Top: i16,
-    Right: i16,
-    Bottom: i16,
-};
-
+// ------ WinAPI -----
 pub const CONSOLE_CHARACTER_ATTRIBUTES = packed struct(u16) {
     FOREGROUND_BLUE: u1 = 0,
     FOREGROUND_GREEN: u1 = 0,
@@ -44,6 +29,12 @@ pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwMaximumWindowSize: windows.COORD,
 };
 
+pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
+
+// ------ Global Variables -----
 var zilo_version: []const u8 = "0.0.1";
 
 /// disables canonical mode.
@@ -62,24 +53,36 @@ var enable_virtual_terminal_input: u32 = 0x0200;
 var enable_virtual_terminal_processing: u32 = 0x0004;
 var disable_newline_auto_return: u32 = 0x0008;
 
-pub const EditorKey = enum {
-    ARROW_UP,
-    ARROW_DOWN,
-    ARROW_RIGHT,
-    ARROW_LEFT,
-    PAGE_UP,
-    PAGE_DOWN,
-    HOME,
-    END,
-    DEL,
-    MODE_CHANGE,
-    ENTER,
+const EditorError = error{
+    ExitKeyPressed,
 };
 
-pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
+const EditorMode = enum {
+    Insert,
+    Normal,
+};
+
+pub const SMALL_RECT = extern struct {
+    Left: i16,
+    Top: i16,
+    Right: i16,
+    Bottom: i16,
+};
+
+pub const EditorKey = enum {
+    ArrowUp,
+    ArrowDown,
+    ArrowRight,
+    ArrowLeft,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Del,
+    ModeChange,
+    Enter,
+    Backspace,
+};
 
 /// Returns the control key for that character.
 ///
@@ -212,7 +215,7 @@ pub const Editor = struct {
                 const seq0 = try self.readTimeout(50);
                 if (seq0 == null) {
                     if (self.mode != EditorMode.Normal) {
-                        return .{ .key = EditorKey.MODE_CHANGE };
+                        return .{ .key = EditorKey.ModeChange };
                     } else {
                         return .{ .value = value };
                     }
@@ -226,32 +229,32 @@ pub const Editor = struct {
                                 const seq2 = try self.reader.takeByte();
                                 if (seq2 == '~') {
                                     return switch (seq1) {
-                                        '1' => .{ .key = EditorKey.HOME },
-                                        '3' => .{ .key = EditorKey.DEL },
-                                        '4' => .{ .key = EditorKey.END },
-                                        '5' => .{ .key = EditorKey.PAGE_UP },
-                                        '6' => .{ .key = EditorKey.PAGE_DOWN },
-                                        '7' => .{ .key = EditorKey.HOME },
-                                        '8' => .{ .key = EditorKey.END },
+                                        '1' => .{ .key = EditorKey.Home },
+                                        '3' => .{ .key = EditorKey.Del },
+                                        '4' => .{ .key = EditorKey.End },
+                                        '5' => .{ .key = EditorKey.PageUp },
+                                        '6' => .{ .key = EditorKey.PageDown },
+                                        '7' => .{ .key = EditorKey.Home },
+                                        '8' => .{ .key = EditorKey.End },
                                         else => .{ .value = value },
                                     };
                                 }
                                 return .{ .value = value };
                             },
-                            'A' => .{ .key = EditorKey.ARROW_UP },
-                            'B' => .{ .key = EditorKey.ARROW_DOWN },
-                            'C' => .{ .key = EditorKey.ARROW_RIGHT },
-                            'D' => .{ .key = EditorKey.ARROW_LEFT },
-                            'H' => .{ .key = EditorKey.HOME },
-                            'F' => .{ .key = EditorKey.END },
+                            'A' => .{ .key = EditorKey.ArrowUp },
+                            'B' => .{ .key = EditorKey.ArrowDown },
+                            'C' => .{ .key = EditorKey.ArrowRight },
+                            'D' => .{ .key = EditorKey.ArrowLeft },
+                            'H' => .{ .key = EditorKey.Home },
+                            'F' => .{ .key = EditorKey.End },
                             else => .{ .value = value },
                         };
                     },
                     'O' => {
                         const seq1 = try self.reader.takeByte();
                         return switch (seq1) {
-                            'H' => .{ .key = EditorKey.HOME },
-                            'F' => .{ .key = EditorKey.END },
+                            'H' => .{ .key = EditorKey.Home },
+                            'F' => .{ .key = EditorKey.End },
                             else => .{ .value = value },
                         };
                     },
@@ -261,34 +264,37 @@ pub const Editor = struct {
                 };
             },
             'w' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_UP };
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowUp };
                 return .{ .value = value };
             },
             's' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_DOWN };
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowDown };
                 return .{ .value = value };
             },
             'a' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_LEFT };
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowLeft };
                 return .{ .value = value };
             },
             'd' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_RIGHT };
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowRight };
                 return .{ .value = value };
             },
             'i' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.MODE_CHANGE };
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ModeChange };
                 return .{ .value = value };
             },
             '\r' => {
                 if (self.mode == EditorMode.Insert) {
                     const seq0 = try self.readTimeout(50);
                     if (seq0 == '\n') {
-                        return .{ .key = EditorKey.ENTER };
+                        return .{ .key = EditorKey.Enter };
                     }
-                    return .{ .key = EditorKey.ENTER };
+                    return .{ .key = EditorKey.Enter };
                 }
                 return .{ .value = value };
+            },
+            '\x7f' => {
+                return .{ .key = EditorKey.Backspace };
             },
             else => .{ .value = value },
         };
@@ -299,31 +305,31 @@ pub const Editor = struct {
         return switch (value) {
             .key => {
                 return switch (value.key) {
-                    EditorKey.ARROW_LEFT => {
+                    EditorKey.ArrowLeft => {
                         if (self.cursor.x > 0) self.cursor.x -= 1;
                     },
-                    EditorKey.ARROW_RIGHT => {
+                    EditorKey.ArrowRight => {
                         if (self.cursor.x < self.terminal_cols) self.cursor.x += 1;
                     },
-                    EditorKey.ARROW_UP => {
+                    EditorKey.ArrowUp => {
                         if (self.cursor.y > 0) self.cursor.y -= 1;
                     },
-                    EditorKey.ARROW_DOWN => {
+                    EditorKey.ArrowDown => {
                         if (self.cursor.y < self.terminal_rows) self.cursor.y += 1;
                     },
-                    EditorKey.PAGE_UP => {
+                    EditorKey.PageUp => {
                         self.cursor.y = 0;
                     },
-                    EditorKey.PAGE_DOWN => {
+                    EditorKey.PageDown => {
                         self.cursor.y = self.terminal_rows - 1;
                     },
-                    EditorKey.HOME => {
+                    EditorKey.Home => {
                         self.cursor.x = 0;
                     },
-                    EditorKey.END => {
+                    EditorKey.End => {
                         self.cursor.x = self.terminal_cols - 1;
                     },
-                    EditorKey.MODE_CHANGE => {
+                    EditorKey.ModeChange => {
                         if (self.mode == EditorMode.Normal) {
                             self.mode = EditorMode.Insert;
                             const y: u8 = @intCast(@min(self.rows.items.len - 1, self.cursor.y));
@@ -334,7 +340,7 @@ pub const Editor = struct {
                             self.mode = EditorMode.Normal;
                         }
                     },
-                    EditorKey.ENTER => {
+                    EditorKey.Enter => {
                         if (self.mode == EditorMode.Normal) return;
                         _ = try self.rows.append(alloc, Row{
                             .buffer = try alloc.alloc(u8, self.terminal_cols),
@@ -343,7 +349,13 @@ pub const Editor = struct {
                         self.cursor.x = 0;
                         @memset(self.rows.items[self.cursor.y].buffer, 0);
                     },
-                    EditorKey.DEL => {},
+                    EditorKey.Del, EditorKey.Backspace => {
+                        const row = &self.rows.items[self.cursor.y];
+                        if (self.mode == EditorMode.Insert and self.cursor.x > 0) {
+                            row.buffer[self.cursor.x - 1] = 0;
+                        }
+                        if (self.cursor.x > 0) self.cursor.x -= 1;
+                    },
                 };
             },
             .value => {
@@ -368,7 +380,7 @@ pub const Editor = struct {
         // Wipe the scroll back buffer, i.e the history above visible window.
         _ = try self.writer.write("\x1b[3J");
 
-        try self.drawRows();
+        try self.renderScreen();
         _ = try self.writer.print("\x1b[{d};{d}H", .{ self.cursor.y + 1, self.cursor.x + 1 });
 
         // Unhide the cursor
@@ -388,7 +400,7 @@ pub const Editor = struct {
         self.cursor.x += 1;
     }
 
-    pub fn drawRows(self: *Editor) !void {
+    pub fn renderScreen(self: *Editor) !void {
         _ = try self.writer.write("\x1b[K");
 
         for (0..self.rows.items.len) |idx| {
