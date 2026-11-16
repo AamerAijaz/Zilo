@@ -73,6 +73,7 @@ pub const EditorKey = enum {
     END,
     DEL,
     MODE_CHANGE,
+    ENTER,
 };
 
 pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
@@ -90,6 +91,11 @@ pub const Row = struct {
     buffer: []u8,
 };
 
+pub const Position = struct {
+    x: u8,
+    y: u8,
+};
+
 pub const Editor = struct {
     console: struct {
         initial_input_mode: windows.DWORD = 0,
@@ -100,13 +106,11 @@ pub const Editor = struct {
     writer: *std.Io.Writer,
     terminal_rows: u8, // Number of rows the terminal currently has.
     terminal_cols: u8, // Number of columns the terminal currently has.
-    cursor: struct {
-        x: u8,
-        y: u8,
-    },
+    cursor: Position,
     mode: EditorMode,
+    rows: std.ArrayList(Row),
 
-    pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) !Editor {
+    pub fn init(alloc: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !Editor {
         const stdin = std.Io.File.stdin();
         const stdout = std.Io.File.stdout();
 
@@ -128,6 +132,14 @@ pub const Editor = struct {
             return error.EditorInitializationFailure;
         }
 
+        const terminal_cols: u8 = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+        var rows = try std.ArrayList(Row).initCapacity(alloc, 1);
+        try rows.append(alloc, Row{ .buffer = try alloc.alloc(u8, terminal_cols) });
+        for (0..rows.items.len) |idx| {
+            rows.items[idx].buffer = try alloc.alloc(u8, terminal_cols);
+            @memset(rows.items[idx].buffer, 0);
+        }
+
         return Editor{
             .reader = reader,
             .writer = writer,
@@ -137,12 +149,13 @@ pub const Editor = struct {
                 .console_screen_buffer_info = csbi,
             },
             .terminal_rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
-            .terminal_cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+            .terminal_cols = terminal_cols,
             .cursor = .{
                 .x = 0,
                 .y = 0,
             },
             .mode = EditorMode.Normal,
+            .rows = rows,
         };
     }
 
@@ -202,10 +215,10 @@ pub const Editor = struct {
                                         '6' => .{ .key = EditorKey.PAGE_DOWN },
                                         '7' => .{ .key = EditorKey.HOME },
                                         '8' => .{ .key = EditorKey.END },
-                                        else => .{ .value = '\x1b' },
+                                        else => .{ .value = value },
                                     };
                                 }
-                                return .{ .value = '\x1b' };
+                                return .{ .value = value };
                             },
                             'A' => .{ .key = EditorKey.ARROW_UP },
                             'B' => .{ .key = EditorKey.ARROW_DOWN },
@@ -213,7 +226,7 @@ pub const Editor = struct {
                             'D' => .{ .key = EditorKey.ARROW_LEFT },
                             'H' => .{ .key = EditorKey.HOME },
                             'F' => .{ .key = EditorKey.END },
-                            else => .{ .value = '\x1b' },
+                            else => .{ .value = value },
                         };
                     },
                     'O' => {
@@ -221,34 +234,56 @@ pub const Editor = struct {
                         return switch (seq1) {
                             'H' => .{ .key = EditorKey.HOME },
                             'F' => .{ .key = EditorKey.END },
-                            else => .{ .value = '\x1b' },
+                            else => .{ .value = value },
                         };
                     },
                     'n' => {
                         if (self.mode != EditorMode.Normal) {
                             return .{ .key = EditorKey.MODE_CHANGE };
                         } else {
-                            return .{ .value = '\x1b' };
+                            return .{ .value = value };
                         }
                     },
                     else => {
-                        return .{ .value = '\x1b' };
+                        return .{ .value = value };
                     },
                 };
             },
-            'w' => .{ .key = EditorKey.ARROW_UP },
-            's' => .{ .key = EditorKey.ARROW_DOWN },
-            'a' => .{ .key = EditorKey.ARROW_LEFT },
-            'd' => .{ .key = EditorKey.ARROW_RIGHT },
+            'w' => {
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_UP };
+                return .{ .value = value };
+            },
+            's' => {
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_DOWN };
+                return .{ .value = value };
+            },
+            'a' => {
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_LEFT };
+                return .{ .value = value };
+            },
+            'd' => {
+                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ARROW_RIGHT };
+                return .{ .value = value };
+            },
             'i' => {
                 if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.MODE_CHANGE };
+                return .{ .value = value };
+            },
+            '\r' => {
+                if (self.mode == EditorMode.Insert) {
+                    const seq0 = try self.reader.takeByte();
+                    if (seq0 == '\n') {
+                        return .{ .key = EditorKey.ENTER };
+                    }
+                    return .{ .key = EditorKey.ENTER };
+                }
                 return .{ .value = value };
             },
             else => .{ .value = value },
         };
     }
 
-    pub fn processKeypress(self: *Editor) !void {
+    pub fn processKeypress(self: *Editor, alloc: std.mem.Allocator) !void {
         const value = try self.readKey();
         return switch (value) {
             .key => {
@@ -280,9 +315,22 @@ pub const Editor = struct {
                     EditorKey.MODE_CHANGE => {
                         if (self.mode == EditorMode.Normal) {
                             self.mode = EditorMode.Insert;
+                            const y: u8 = @intCast(@min(self.rows.items.len - 1, self.cursor.y));
+                            const x: u8 = @intCast(@min(self.rows.items[y].buffer.len - 1, self.cursor.x));
+                            self.cursor.x = x;
+                            self.cursor.y = y;
                         } else {
                             self.mode = EditorMode.Normal;
                         }
+                    },
+                    EditorKey.ENTER => {
+                        if (self.mode == EditorMode.Normal) return;
+                        _ = try self.rows.append(alloc, Row{
+                            .buffer = try alloc.alloc(u8, self.terminal_cols),
+                        });
+                        self.cursor.y += 1;
+                        self.cursor.x = 0;
+                        @memset(self.rows.items[self.cursor.y].buffer, 0);
                     },
                     EditorKey.DEL => {},
                 };
@@ -292,6 +340,7 @@ pub const Editor = struct {
                     controlKey('q') => EditorError.ExitKeyPressed,
                     else => {
                         if (self.mode == EditorMode.Normal) return;
+                        self.writeCharacter(value.value);
                     },
                 };
             },
@@ -317,9 +366,29 @@ pub const Editor = struct {
         try self.writer.flush();
     }
 
+    /// Writes the character at the current cursor's position.
+    pub fn writeCharacter(self: *Editor, character: u8) void {
+        std.debug.assert(self.mode == EditorMode.Insert);
+        std.debug.assert(self.cursor.y < self.rows.items.len);
+        std.debug.assert(self.cursor.x < self.rows.items[self.cursor.y].buffer.len);
+
+        const slice = self.rows.items[self.cursor.y].buffer;
+        slice[self.cursor.x] = character;
+        self.cursor.x += 1;
+    }
+
     pub fn drawRows(self: *Editor) !void {
         _ = try self.writer.write("\x1b[K");
-        for (0..self.terminal_rows) |i| {
+
+        for (0..self.rows.items.len) |idx| {
+            _ = try self.writer.write(self.rows.items[idx].buffer);
+            _ = try self.writer.write("\r\n");
+            _ = try self.writer.write("\x1b[K");
+        }
+
+        const start: u8 = @intCast(self.rows.items.len);
+        const end: u8 = @intCast(self.terminal_rows);
+        for (start..end) |i| {
             if (i < self.terminal_rows - 1) {
                 _ = try self.writer.write("~");
                 _ = try self.writer.write("\r\n");
@@ -342,7 +411,8 @@ pub fn main(init: std.process.Init) !void {
     var stdin_reader = std.Io.File.stdin().reader(init.io, &read_buffer);
     var stdout_writer = std.Io.File.stdout().writer(init.io, &write_buffer);
 
-    var editor = Editor.init(&stdin_reader.interface, &stdout_writer.interface) catch |err| {
+    const allocator = init.arena.allocator();
+    var editor = Editor.init(allocator, &stdin_reader.interface, &stdout_writer.interface) catch |err| {
         std.debug.print("ERROR: Unable to initialize editor: {any}\r\n", .{err});
         return err;
     };
@@ -355,7 +425,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ERROR: Refreshing screen: {any}\r\n", .{err});
         };
 
-        editor.processKeypress() catch |err| switch (err) {
+        editor.processKeypress(allocator) catch |err| switch (err) {
             EditorError.ExitKeyPressed => {
                 _ = try editor.writer.write("\x1b[2J");
                 _ = try editor.writer.write("\x1b[H");
