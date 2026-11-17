@@ -83,6 +83,7 @@ pub const EditorKey = enum {
     ModeChange,
     Enter,
     Backspace,
+    Tab,
     Invalid,
     Quit,
 };
@@ -414,6 +415,12 @@ pub const Editor = struct {
                 win.VirtualKey.BackSpace, win.VirtualKey.Delete => {
                     return .{ .key = EditorKey.Backspace };
                 },
+                win.VirtualKey.Tab => {
+                    if (self.mode == EditorMode.Normal) {
+                        return .{ .key = EditorKey.Invalid };
+                    }
+                    return .{ .key = EditorKey.Tab };
+                },
                 win.VirtualKey.Enter => {
                     if (self.mode == EditorMode.Insert) {
                         return .{ .key = EditorKey.Enter };
@@ -490,15 +497,14 @@ pub const Editor = struct {
                     },
                     EditorKey.Enter => {
                         if (self.mode == EditorMode.Normal) return;
-
-                        _ = try self.rows.append(alloc, Row{
-                            .buffer = try alloc.alloc(u8, self.terminal_cols),
-                            .len = 0,
-                        });
-
-                        self.cursor.y += 1;
-                        self.cursor.x = 0;
-                        @memset(self.rows.items[self.cursor.y].buffer, 0);
+                        try self.addRow(alloc);
+                    },
+                    EditorKey.Tab => {
+                        if (self.mode == EditorMode.Normal) return;
+                        const cx = @min(self.cursor.x + 4, self.terminal_cols);
+                        for (self.cursor.x..cx) |_| {
+                            try self.writeCharacter(alloc, 32);
+                        }
                     },
                     EditorKey.Del, EditorKey.Backspace => {
                         var row = &self.rows.items[self.cursor.y];
@@ -509,11 +515,13 @@ pub const Editor = struct {
                             }
                             self.cursor.x -= 1;
                         } else if (self.mode == EditorMode.Insert and self.cursor.x == 0 and self.cursor.y > 0) {
-                            alloc.free(row.buffer);
-                            _ = self.rows.orderedRemove(self.cursor.y);
+                            if (row.len == 0) {
+                                alloc.free(row.buffer);
+                                _ = self.rows.orderedRemove(self.cursor.y);
+                            }
                             self.cursor.y -= 1;
                             self.cursor.x = self.rows.items[self.cursor.y].len;
-                        } else if (self.mode == EditorMode.Normal) {
+                        } else if (self.mode == EditorMode.Normal and self.cursor.x > 0) {
                             self.cursor.x -= 1;
                         }
                     },
@@ -526,7 +534,7 @@ pub const Editor = struct {
                     controlKey('q') => EditorError.ExitKeyPressed,
                     else => {
                         if (self.mode == EditorMode.Normal) return;
-                        self.writeCharacter(value.value);
+                        try self.writeCharacter(alloc, value.value);
                     },
                 };
             },
@@ -552,11 +560,29 @@ pub const Editor = struct {
         try self.writer.flush();
     }
 
+    /// Adds a new row.
+    /// Advances the cursor's y coordinate by one.
+    pub fn addRow(self: *Editor, alloc: std.mem.Allocator) !void {
+        self.cursor.y += 1;
+        try self.rows.insert(alloc, self.cursor.y, Row{
+            .buffer = try alloc.alloc(u8, self.terminal_cols),
+            .len = 0,
+        });
+        @memset(self.rows.items[self.cursor.y].buffer, 0);
+        self.cursor.x = 0;
+    }
+
     /// Writes the character at the current cursor's position.
-    pub fn writeCharacter(self: *Editor, character: u8) void {
+    /// Advances the cursor's x coordinate by one.
+    /// May add a new row if the cursor is at the edge of the screen.
+    pub fn writeCharacter(self: *Editor, alloc: std.mem.Allocator, character: u8) !void {
         std.debug.assert(self.mode == EditorMode.Insert);
         std.debug.assert(self.cursor.y < self.rows.items.len);
-        std.debug.assert(self.cursor.x < self.rows.items[self.cursor.y].buffer.len);
+        std.debug.assert(self.cursor.x < self.rows.items[self.cursor.y].buffer.len + 1);
+
+        if (self.cursor.x == self.terminal_cols - 1) {
+            try self.addRow(alloc);
+        }
 
         const row = &self.rows.items[self.cursor.y];
         const slice = row.buffer;

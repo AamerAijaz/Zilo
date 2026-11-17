@@ -11,6 +11,7 @@ pub const right_ctrl_pressed: u32 = 0x0004;
 
 pub const VirtualKey = extern struct {
     pub const BackSpace: u16 = 0x08;
+    pub const Tab: u16 = 0x09;
     pub const Enter: u16 = 0x0D;
     pub const Escape: u16 = 0x1b;
     pub const Space: u16 = 0x20;
