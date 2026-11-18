@@ -171,6 +171,37 @@ pub const Editor = struct {
         };
     }
 
+    pub fn openFile(self: *Editor, io: std.Io, alloc: std.mem.Allocator, file_path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{
+            .mode = .read_only,
+            .allow_directory = false,
+        });
+
+        var buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &buf);
+        var reader = &file_reader.interface;
+
+        const data = try reader.allocRemaining(alloc, .unlimited);
+        defer alloc.free(data);
+
+        self.mode = EditorMode.Insert;
+        var idx: usize = 0;
+        while (idx < data.len) {
+            if (self.cursor.y == self.terminal_rows - 2) break;
+
+            const c = data[idx];
+            if (c == '\r') {
+                try self.addRow(alloc);
+                idx += 1;
+            } else {
+                try self.write(alloc, c);
+            }
+
+            idx += 1;
+        }
+        self.mode = EditorMode.Normal;
+    }
+
     /// By default terminals process input in canonical mode, i.e input from a user is
     /// sent to the program when they press ENTER. To process each character of user input
     /// as they appear, we need the terminal to process input in Raw mode.
@@ -560,13 +591,22 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &write_buffer);
 
     const allocator = init.arena.allocator();
+
     var editor = Editor.init(allocator, &stdin_reader.interface, &stdout_writer.interface) catch |err| {
         std.debug.print("ERROR: Unable to initialize editor: {any}\r\n", .{err});
         return err;
     };
 
+    var it = try init.minimal.args.iterateAllocator(allocator);
+    defer it.deinit();
+
     defer editor.disableRawMode() catch {};
     try editor.enableRawMode();
+
+    _ = it.next();
+    if (it.next()) |path| {
+        try editor.openFile(init.io, allocator, path);
+    }
 
     while (true) {
         editor.refreshScreen() catch |err| {
