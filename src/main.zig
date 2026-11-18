@@ -96,8 +96,7 @@ pub fn controlKey(c: u8) u8 {
 }
 
 pub const Row = struct {
-    buffer: []u8,
-    len: u16,
+    buffer: std.ArrayList(u8),
 };
 
 pub const Position = struct {
@@ -149,15 +148,9 @@ pub const Editor = struct {
         const terminal_cols: u16 = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1);
         var rows = try std.ArrayList(Row).initCapacity(alloc, 1);
         try rows.append(alloc, Row{
-            .buffer = try alloc.alloc(u8, terminal_cols),
-            .len = 0,
+            .buffer = try std.ArrayList(u8).initCapacity(alloc, terminal_cols),
         });
-        for (0..rows.items.len) |idx| {
-            rows.items[idx].buffer = try alloc.alloc(u8, terminal_cols);
-            @memset(rows.items[idx].buffer, 0);
-        }
-
-        std.debug.print("Terminal Columns: {d}\r\n", .{terminal_cols});
+        @memset(rows.items[0].buffer.items, 0);
 
         return Editor{
             .reader = reader,
@@ -220,99 +213,6 @@ pub const Editor = struct {
             return try self.reader.takeByte();
         }
         return null;
-    }
-
-    pub fn readKey(self: *Editor) !union(enum) { key: EditorKey, value: u8 } {
-        const value = try self.reader.takeByte();
-
-        return switch (value) {
-            '\x1b' => {
-                const seq0 = try self.readTimeout(50);
-                if (seq0 == null) {
-                    if (self.mode != EditorMode.Normal) {
-                        return .{ .key = EditorKey.ModeChange };
-                    } else {
-                        return .{ .value = value };
-                    }
-                }
-
-                return switch (seq0.?) {
-                    '[' => {
-                        const seq1 = try self.reader.takeByte();
-                        return switch (seq1) {
-                            '0'...'9' => {
-                                const seq2 = try self.reader.takeByte();
-                                if (seq2 == '~') {
-                                    return switch (seq1) {
-                                        '1' => .{ .key = EditorKey.Home },
-                                        '3' => .{ .key = EditorKey.Del },
-                                        '4' => .{ .key = EditorKey.End },
-                                        '5' => .{ .key = EditorKey.PageUp },
-                                        '6' => .{ .key = EditorKey.PageDown },
-                                        '7' => .{ .key = EditorKey.Home },
-                                        '8' => .{ .key = EditorKey.End },
-                                        else => .{ .value = value },
-                                    };
-                                }
-                                return .{ .value = value };
-                            },
-                            'A' => .{ .key = EditorKey.ArrowUp },
-                            'B' => .{ .key = EditorKey.ArrowDown },
-                            'C' => .{ .key = EditorKey.ArrowRight },
-                            'D' => .{ .key = EditorKey.ArrowLeft },
-                            'H' => .{ .key = EditorKey.Home },
-                            'F' => .{ .key = EditorKey.End },
-                            else => .{ .value = value },
-                        };
-                    },
-                    'O' => {
-                        const seq1 = try self.reader.takeByte();
-                        return switch (seq1) {
-                            'H' => .{ .key = EditorKey.Home },
-                            'F' => .{ .key = EditorKey.End },
-                            else => .{ .value = value },
-                        };
-                    },
-                    else => {
-                        return .{ .value = value };
-                    },
-                };
-            },
-            'w' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowUp };
-                return .{ .value = value };
-            },
-            's' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowDown };
-                return .{ .value = value };
-            },
-            'a' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowLeft };
-                return .{ .value = value };
-            },
-            'd' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ArrowRight };
-                return .{ .value = value };
-            },
-            'i' => {
-                if (self.mode == EditorMode.Normal) return .{ .key = EditorKey.ModeChange };
-                return .{ .value = value };
-            },
-            '\r' => {
-                if (self.mode == EditorMode.Insert) {
-                    const seq0 = try self.readTimeout(50);
-                    if (seq0 == '\n') {
-                        return .{ .key = EditorKey.Enter };
-                    }
-                    return .{ .key = EditorKey.Enter };
-                }
-                return .{ .value = value };
-            },
-            '\x7f' => {
-                return .{ .key = EditorKey.Backspace };
-            },
-            else => .{ .value = value },
-        };
     }
 
     pub fn readInput(self: *Editor) !EditorInput {
@@ -451,44 +351,40 @@ pub const Editor = struct {
         return switch (value) {
             .key => {
                 return switch (value.key) {
-                    EditorKey.ArrowLeft => {
-                        if (self.cursor.x > 0) self.cursor.x -= 1;
-                    },
+                    EditorKey.ArrowLeft => self.moveCursorLeft(),
                     EditorKey.ArrowRight => {
                         const row = &self.rows.items[self.cursor.y];
-                        if (self.cursor.x < row.len) self.cursor.x += 1;
+                        if (self.cursor.x < row.buffer.items.len) self.cursor.x += 1;
                     },
                     EditorKey.ArrowUp => {
-                        if (self.cursor.y > 0) {
-                            self.cursor.y -= 1;
-                            self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].len);
-                        }
+                        self.cursor.y = self.cursor.y -| 1;
+                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
                     },
                     EditorKey.ArrowDown => {
                         if (self.cursor.y + 1 < self.rows.items.len) {
                             self.cursor.y += 1;
-                            self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].len);
+                            self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
                         }
                     },
                     EditorKey.PageUp => {
                         self.cursor.y = 0;
-                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].len);
+                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
                     },
                     EditorKey.PageDown => {
                         self.cursor.y = @intCast(self.rows.items.len - 1);
-                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].len);
+                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
                     },
                     EditorKey.Home => {
                         self.cursor.x = 0;
                     },
                     EditorKey.End => {
-                        self.cursor.x = self.rows.items[self.cursor.y].len - 1;
+                        self.cursor.x = @min(self.rows.items[self.cursor.y].buffer.items.len, self.terminal_cols);
                     },
                     EditorKey.ModeChange => {
                         if (self.mode == EditorMode.Normal) {
                             self.mode = EditorMode.Insert;
                             const y: u8 = @intCast(@min(self.rows.items.len - 1, self.cursor.y));
-                            const x: u8 = @intCast(@min(self.rows.items[y].buffer.len - 1, self.cursor.x));
+                            const x: u8 = @intCast(@min(self.rows.items[y].buffer.items.len, self.cursor.x));
                             self.cursor.x = x;
                             self.cursor.y = y;
                         } else {
@@ -503,26 +399,14 @@ pub const Editor = struct {
                         if (self.mode == EditorMode.Normal) return;
                         const cx = @min(self.cursor.x + 4, self.terminal_cols);
                         for (self.cursor.x..cx) |_| {
-                            try self.writeCharacter(alloc, 32);
+                            try self.write(alloc, 32);
                         }
                     },
                     EditorKey.Del, EditorKey.Backspace => {
-                        var row = &self.rows.items[self.cursor.y];
-                        if (self.mode == EditorMode.Insert and self.cursor.x > 0) {
-                            row.buffer[self.cursor.x - 1] = 0;
-                            if (self.cursor.x == row.len) {
-                                row.len -= 1;
-                            }
-                            self.cursor.x -= 1;
-                        } else if (self.mode == EditorMode.Insert and self.cursor.x == 0 and self.cursor.y > 0) {
-                            if (row.len == 0) {
-                                alloc.free(row.buffer);
-                                _ = self.rows.orderedRemove(self.cursor.y);
-                            }
-                            self.cursor.y -= 1;
-                            self.cursor.x = self.rows.items[self.cursor.y].len;
-                        } else if (self.mode == EditorMode.Normal and self.cursor.x > 0) {
-                            self.cursor.x -= 1;
+                        if (self.mode == EditorMode.Insert) {
+                            try self.delete(alloc);
+                        } else if (self.mode == EditorMode.Normal) {
+                            self.cursor.x = self.cursor.x -| 1;
                         }
                     },
                     EditorKey.Quit => EditorError.ExitKeyPressed,
@@ -534,7 +418,7 @@ pub const Editor = struct {
                     controlKey('q') => EditorError.ExitKeyPressed,
                     else => {
                         if (self.mode == EditorMode.Normal) return;
-                        try self.writeCharacter(alloc, value.value);
+                        try self.write(alloc, value.value);
                     },
                 };
             },
@@ -565,38 +449,75 @@ pub const Editor = struct {
     pub fn addRow(self: *Editor, alloc: std.mem.Allocator) !void {
         self.cursor.y += 1;
         try self.rows.insert(alloc, self.cursor.y, Row{
-            .buffer = try alloc.alloc(u8, self.terminal_cols),
-            .len = 0,
+            .buffer = try std.ArrayList(u8).initCapacity(alloc, self.terminal_cols),
         });
-        @memset(self.rows.items[self.cursor.y].buffer, 0);
+        @memset(self.rows.items[self.cursor.y].buffer.items, 0);
+
+        const prev_row = &self.rows.items[self.cursor.y - 1];
+        const remaining = try alloc.dupe(u8, prev_row.buffer.items[self.cursor.x..]);
+        for (self.cursor.x..prev_row.buffer.items.len) |_| {
+            const c = prev_row.buffer.pop();
+            if (c == null) break;
+        }
+
         self.cursor.x = 0;
+        for (remaining) |c| {
+            try self.writeCharacter(alloc, c);
+        }
+        self.cursor.x = 0;
+    }
+
+    pub fn delete(self: *Editor, alloc: std.mem.Allocator) !void {
+        std.debug.assert(self.mode == EditorMode.Insert);
+        const row = &self.rows.items[self.cursor.y];
+
+        if (self.cursor.x == 0 and self.cursor.y > 0) {
+            const cx = self.rows.items[self.cursor.y - 1].buffer.items.len;
+            const remaining = try row.buffer.toOwnedSlice(alloc);
+            row.buffer.deinit(alloc);
+            _ = self.rows.orderedRemove(self.cursor.y);
+            self.moveCursorLeft();
+            for (remaining) |c| {
+                try self.write(alloc, c);
+            }
+            self.cursor.x = @intCast(cx);
+        } else if (self.cursor.x > 0) {
+            self.moveCursorLeft();
+            _ = row.buffer.orderedRemove(self.cursor.x);
+        }
     }
 
     /// Writes the character at the current cursor's position.
     /// Advances the cursor's x coordinate by one.
-    /// May add a new row if the cursor is at the edge of the screen.
     pub fn writeCharacter(self: *Editor, alloc: std.mem.Allocator, character: u8) !void {
         std.debug.assert(self.mode == EditorMode.Insert);
         std.debug.assert(self.cursor.y < self.rows.items.len);
-        std.debug.assert(self.cursor.x < self.rows.items[self.cursor.y].buffer.len + 1);
+        std.debug.assert(self.cursor.x <= self.rows.items[self.cursor.y].buffer.items.len);
+
+        const row = &self.rows.items[self.cursor.y];
+        try row.buffer.insert(alloc, self.cursor.x, character);
+        self.cursor.x += 1;
+    }
+
+    /// Writes the character at the current cursor's position.
+    /// May add a new row if the cursor is at the edge of the screen.
+    pub fn write(self: *Editor, alloc: std.mem.Allocator, character: u8) !void {
+        std.debug.assert(self.mode == EditorMode.Insert);
+        std.debug.assert(self.cursor.y < self.rows.items.len);
+        std.debug.assert(self.cursor.x <= self.rows.items[self.cursor.y].buffer.items.len);
 
         if (self.cursor.x == self.terminal_cols - 1) {
             try self.addRow(alloc);
         }
 
-        const row = &self.rows.items[self.cursor.y];
-        const slice = row.buffer;
-        slice[self.cursor.x] = character;
-
-        row.len = @max(row.len, self.cursor.x + 1);
-        self.cursor.x += 1;
+        return try self.writeCharacter(alloc, character);
     }
 
     pub fn renderRows(self: *Editor) !void {
         try self.writer.writeAll("\x1b[K");
 
         for (0..self.rows.items.len) |idx| {
-            try self.writer.writeAll(self.rows.items[idx].buffer[0 .. self.rows.items[idx].len + 1]);
+            try self.writer.writeAll(self.rows.items[idx].buffer.items);
             try self.writer.writeAll("\r\n");
             try self.writer.writeAll("\x1b[K");
         }
@@ -616,6 +537,18 @@ pub const Editor = struct {
             }
             // Clear the line after the current position.
             try self.writer.writeAll("\x1b[K");
+        }
+    }
+
+    pub fn moveCursorLeft(self: *Editor) void {
+        if (self.cursor.x > 0) {
+            self.cursor.x -= 1;
+            return;
+        }
+
+        if (self.cursor.y > 0) {
+            self.cursor.y -= 1;
+            self.cursor.x = @intCast(self.rows.items[self.cursor.y].buffer.items.len);
         }
     }
 };
