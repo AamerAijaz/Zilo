@@ -59,6 +59,8 @@ pub const VirtualKey = extern struct {
     pub const KeyX: u16 = 0x58;
     pub const KeyY: u16 = 0x59;
     pub const KeyZ: u16 = 0x5A;
+    pub const F2: u16 = 0x71;
+    pub const F3: u16 = 0x72;
 };
 
 pub extern "kernel32" fn ReadConsoleInputA(
@@ -112,3 +114,4 @@ pub const FOCUS_EVENT_RECORD = extern struct {
 pub const WINDOW_BUFFER_SIZE_RECORD = extern struct {
     dwSize: windows.COORD,
 };
+

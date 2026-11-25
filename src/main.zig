@@ -36,7 +36,7 @@ pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDL
 pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
 
 // ------ Global Variables -----
-var zilo_version: []const u8 = "0.0.1";
+var zilo_version: []const u8 = "0.0.2";
 
 /// disables canonical mode.
 var enable_line_input: u32 = 0x0002;
@@ -86,6 +86,7 @@ pub const EditorKey = enum {
     Tab,
     Invalid,
     Quit,
+    Save,
 };
 
 /// Returns the control key for that character.
@@ -96,12 +97,8 @@ pub fn controlKey(c: u8) u8 {
 }
 
 pub const Row = struct {
-    buffer: std.ArrayList(u8),
-};
-
-pub const Position = struct {
-    x: u16,
-    y: u16,
+    start: u16,
+    end: u16,
 };
 
 pub const EditorInput = union(enum) {
@@ -109,6 +106,12 @@ pub const EditorInput = union(enum) {
     value: u8,
 };
 
+const Position = struct {
+    x: u16,
+    y: u16,
+};
+
+/// Editor
 pub const Editor = struct {
     console: struct {
         initial_input_mode: windows.DWORD = 0,
@@ -119,9 +122,12 @@ pub const Editor = struct {
     writer: *std.Io.Writer,
     terminal_rows: u16, // Number of rows the terminal currently has.
     terminal_cols: u16, // Number of columns the terminal currently has.
-    cursor: Position,
+    cursor: u16,
+    row_offset: u16 = 0,
     mode: EditorMode,
     rows: std.ArrayList(Row),
+    buffer: std.ArrayList(u8),
+    path: []const u8,
 
     pub fn init(alloc: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) !Editor {
         const stdin = std.Io.File.stdin();
@@ -145,12 +151,19 @@ pub const Editor = struct {
             return error.EditorInitializationFailure;
         }
 
-        const terminal_cols: u16 = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1);
-        var rows = try std.ArrayList(Row).initCapacity(alloc, 1);
+        var buffer = try std.ArrayList(u8).initCapacity(alloc, 1024);
+        errdefer buffer.deinit(alloc);
+
+        var rows = try std.ArrayList(Row).initCapacity(alloc, 24);
+        errdefer rows.deinit(alloc);
+
         try rows.append(alloc, Row{
-            .buffer = try std.ArrayList(u8).initCapacity(alloc, terminal_cols),
+            .start = 0,
+            .end = 0,
         });
-        @memset(rows.items[0].buffer.items, 0);
+
+        // Wipe the scroll back buffer, i.e the history above visible window.
+        try writer.writeAll("\x1b[3J");
 
         return Editor{
             .reader = reader,
@@ -161,45 +174,115 @@ pub const Editor = struct {
                 .console_screen_buffer_info = csbi,
             },
             .terminal_rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
-            .terminal_cols = terminal_cols,
-            .cursor = .{
-                .x = 0,
-                .y = 0,
-            },
+            .terminal_cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+            .cursor = 0,
+            .row_offset = 0,
             .mode = EditorMode.Normal,
             .rows = rows,
+            .buffer = buffer,
+            .path = "",
         };
     }
 
-    pub fn openFile(self: *Editor, io: std.Io, alloc: std.mem.Allocator, file_path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{
-            .mode = .read_only,
-            .allow_directory = false,
+    pub fn openFile(self: *Editor, io: std.Io, alloc: std.mem.Allocator, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = .read_write,
         });
+        defer file.close(io);
 
-        var buf: [4096]u8 = undefined;
-        var file_reader = file.reader(io, &buf);
-        var reader = &file_reader.interface;
+        var buffer: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &buffer);
+        var file_reader_if = &file_reader.interface;
 
-        const data = try reader.allocRemaining(alloc, .unlimited);
-        defer alloc.free(data);
+        var buffer_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &self.buffer);
+        defer buffer_writer.deinit();
 
-        self.mode = EditorMode.Insert;
-        var idx: usize = 0;
-        while (idx < data.len) {
-            if (self.cursor.y == self.terminal_rows - 2) break;
+        var pending_cr = false;
+        while (true) {
+            const value = file_reader_if.takeByte() catch |err| switch (err) {
+                std.Io.Reader.Error.EndOfStream => break,
+                else => {
+                    return err;
+                },
+            };
 
-            const c = data[idx];
-            if (c == '\r') {
-                try self.addRow(alloc);
-                idx += 1;
-            } else {
-                try self.write(alloc, c);
+            if (pending_cr) {
+                pending_cr = false;
+                if (value == '\n') {
+                    try buffer_writer.writer.writeAll("\n");
+                    continue;
+                } else {
+                    try buffer_writer.writer.writeAll("\r");
+                }
             }
 
-            idx += 1;
+            if (value == '\r') {
+                pending_cr = true;
+            } else {
+                try buffer_writer.writer.writeByte(value);
+            }
         }
-        self.mode = EditorMode.Normal;
+
+        if (pending_cr) {
+            try buffer_writer.writer.writeAll("\r");
+        }
+
+        try buffer_writer.writer.flush();
+
+        self.buffer = buffer_writer.toArrayList();
+        try self.updateRows(alloc);
+
+        self.path = path;
+    }
+
+    pub fn save(self: *Editor, io: std.Io) !void {
+        if (std.mem.eql(u8, self.path, ""))
+            return;
+
+        var file = try std.Io.Dir.cwd().openFile(
+            io,
+            self.path,
+            .{ .mode = .write_only },
+        );
+        defer file.close(io);
+
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writer(io, &write_buf);
+        var file_writer_if = &file_writer.interface;
+
+        for (0..self.rows.items.len) |idx| {
+            const row = &self.rows.items[idx];
+            const buf = self.buffer.items[row.start..row.end];
+
+            try file_writer_if.writeAll(buf);
+            if (row.end == self.buffer.items.len or self.buffer.items[row.end] == '\n') {
+                try file_writer_if.writeAll("\r\n");
+            } else {
+                try file_writer_if.writeByte(self.buffer.items[row.end]);
+            }
+        }
+
+        try file_writer_if.flush();
+    }
+
+    /// Recomputes the rows.
+    /// Each rows has an index to the beginning and the end of the rows content's in the buffer.
+    /// Ensures that there is at least one row at all times.
+    pub fn updateRows(self: *Editor, alloc: std.mem.Allocator) !void {
+        self.rows.clearRetainingCapacity();
+        var row: Row = .{ .start = 0, .end = 0 };
+
+        for (0..self.buffer.items.len) |idx| {
+            const c = self.buffer.items[idx];
+            if (c == '\n') {
+                row.end = @intCast(idx);
+                try self.rows.append(alloc, row);
+                row.start = @intCast(idx + 1);
+            }
+        }
+        row.end = @intCast(self.buffer.items.len);
+
+        try self.rows.append(alloc, row);
     }
 
     /// By default terminals process input in canonical mode, i.e input from a user is
@@ -264,6 +347,9 @@ pub const Editor = struct {
                 switch (event.wVirtualKeyCode) {
                     win.VirtualKey.KeyQ => {
                         return .{ .key = EditorKey.Quit };
+                    },
+                    win.VirtualKey.KeyS => {
+                        return .{ .key = EditorKey.Save };
                     },
                     else => {
                         return .{ .key = EditorKey.Invalid };
@@ -343,8 +429,11 @@ pub const Editor = struct {
                 },
 
                 // ------------ Text --------------
-                win.VirtualKey.BackSpace, win.VirtualKey.Delete => {
+                win.VirtualKey.BackSpace => {
                     return .{ .key = EditorKey.Backspace };
+                },
+                win.VirtualKey.Delete => {
+                    return .{ .key = EditorKey.Del };
                 },
                 win.VirtualKey.Tab => {
                     if (self.mode == EditorMode.Normal) {
@@ -365,6 +454,10 @@ pub const Editor = struct {
                     return .{ .key = EditorKey.Invalid };
                 },
 
+                win.VirtualKey.F2 => {
+                    return .{ .key = EditorKey.Save };
+                },
+
                 else => {
                     if (event.uChar.AsciiChar == 0) {
                         return .{ .key = EditorKey.Invalid };
@@ -377,70 +470,63 @@ pub const Editor = struct {
         return .{ .key = EditorKey.Invalid };
     }
 
-    pub fn processKeypress(self: *Editor, alloc: std.mem.Allocator) !void {
+    pub fn processKeypress(self: *Editor, io: std.Io, alloc: std.mem.Allocator) !void {
         const value = try self.readInput();
         return switch (value) {
             .key => {
                 return switch (value.key) {
-                    EditorKey.ArrowLeft => self.moveCursorLeft(),
+                    EditorKey.ArrowLeft => {
+                        self.cursor = self.cursor -| 1;
+                    },
                     EditorKey.ArrowRight => {
-                        const row = &self.rows.items[self.cursor.y];
-                        if (self.cursor.x < row.buffer.items.len) self.cursor.x += 1;
+                        const lower: u16 = 0;
+                        const upper: u16 = @intCast(self.buffer.items.len);
+                        self.cursor = std.math.clamp(self.cursor + 1, lower, upper);
                     },
                     EditorKey.ArrowUp => {
-                        self.cursor.y = self.cursor.y -| 1;
-                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
+                        const cur = self.getCursorPos();
+                        if (cur.y == 0) return;
+
+                        const prev = &self.rows.items[cur.y - 1];
+                        self.cursor = prev.start + std.math.clamp(cur.x, 0, prev.end - prev.start);
                     },
                     EditorKey.ArrowDown => {
-                        if (self.cursor.y + 1 < self.rows.items.len) {
-                            self.cursor.y += 1;
-                            self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
-                        }
+                        const cursor_position = self.getCursorPos();
+                        if (cursor_position.y >= self.rows.items.len - 1) return;
+
+                        const next = &self.rows.items[cursor_position.y + 1];
+                        self.cursor = next.start + std.math.clamp(cursor_position.x, 0, next.end - next.start);
                     },
-                    EditorKey.PageUp => {
-                        self.cursor.y = 0;
-                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
-                    },
-                    EditorKey.PageDown => {
-                        self.cursor.y = @intCast(self.rows.items.len - 1);
-                        self.cursor.x = @min(self.cursor.x, self.rows.items[self.cursor.y].buffer.items.len);
-                    },
-                    EditorKey.Home => {
-                        self.cursor.x = 0;
-                    },
-                    EditorKey.End => {
-                        self.cursor.x = @min(self.rows.items[self.cursor.y].buffer.items.len, self.terminal_cols);
-                    },
+                    EditorKey.PageUp => {},
+                    EditorKey.PageDown => {},
+                    EditorKey.Home => {},
+                    EditorKey.End => {},
                     EditorKey.ModeChange => {
                         if (self.mode == EditorMode.Normal) {
                             self.mode = EditorMode.Insert;
-                            const y: u8 = @intCast(@min(self.rows.items.len - 1, self.cursor.y));
-                            const x: u8 = @intCast(@min(self.rows.items[y].buffer.items.len, self.cursor.x));
-                            self.cursor.x = x;
-                            self.cursor.y = y;
                         } else {
                             self.mode = EditorMode.Normal;
                         }
                     },
                     EditorKey.Enter => {
-                        if (self.mode == EditorMode.Normal) return;
-                        try self.addRow(alloc);
+                        try self.write(alloc, '\n');
                     },
                     EditorKey.Tab => {
-                        if (self.mode == EditorMode.Normal) return;
-                        const cx = @min(self.cursor.x + 4, self.terminal_cols);
-                        for (self.cursor.x..cx) |_| {
-                            try self.write(alloc, 32);
-                        }
+                        try self.write(alloc, 32);
+                        try self.write(alloc, 32);
+                        try self.write(alloc, 32);
+                        try self.write(alloc, 32);
                     },
-                    EditorKey.Del, EditorKey.Backspace => {
-                        if (self.mode == EditorMode.Insert) {
-                            try self.delete(alloc);
-                        } else if (self.mode == EditorMode.Normal) {
-                            self.cursor.x = self.cursor.x -| 1;
-                        }
+                    EditorKey.Backspace => {
+                        try self.backspace(alloc);
+                    },
+                    EditorKey.Del => {
+                        try self.delete(alloc);
                     },
                     EditorKey.Quit => EditorError.ExitKeyPressed,
+                    EditorKey.Save => {
+                        try self.save(io);
+                    },
                     EditorKey.Invalid => {},
                 };
             },
@@ -456,18 +542,44 @@ pub const Editor = struct {
         };
     }
 
-    pub fn refreshScreen(self: *Editor) !void {
+    /// Gets the current cursor position in terms of 0-indexed x, y.
+    pub fn getCursorPos(self: *Editor) Position {
+        if (self.cursor > self.buffer.items.len) {
+            self.cursor = @intCast(self.buffer.items.len);
+        }
+
+        var cx: u16 = 0;
+        var cy: u16 = 0;
+
+        for (0..self.rows.items.len) |idx| {
+            const row = &self.rows.items[idx];
+            if (self.cursor >= row.start and self.cursor <= row.end) {
+                cy = @intCast(idx);
+                cx = @intCast(self.cursor - row.start);
+                break;
+            }
+        }
+
+        return .{
+            .x = cx,
+            .y = cy,
+        };
+    }
+
+    pub fn draw(self: *Editor) !void {
+        self.scroll();
+
         // Hide the cursor.
         try self.writer.writeAll("\x1b[?25l");
 
         // Position the cursor at the first column and row.
         try self.writer.writeAll("\x1b[H");
 
-        // Wipe the scroll back buffer, i.e the history above visible window.
-        try self.writer.writeAll("\x1b[3J");
-
         try self.renderRows();
-        _ = try self.writer.print("\x1b[{d};{d}H", .{ self.cursor.y + 1, self.cursor.x + 1 });
+
+        // Draw the cursor.
+        const cursor_position = self.getCursorPos();
+        _ = try self.writer.print("\x1b[{d};{d}H", .{ cursor_position.y + 1 - self.row_offset, cursor_position.x + 1 });
 
         // Unhide the cursor
         try self.writer.writeAll("\x1b[?25h");
@@ -475,112 +587,88 @@ pub const Editor = struct {
         try self.writer.flush();
     }
 
-    /// Adds a new row.
-    /// Advances the cursor's y coordinate by one.
-    pub fn addRow(self: *Editor, alloc: std.mem.Allocator) !void {
-        self.cursor.y += 1;
-        try self.rows.insert(alloc, self.cursor.y, Row{
-            .buffer = try std.ArrayList(u8).initCapacity(alloc, self.terminal_cols),
-        });
-        @memset(self.rows.items[self.cursor.y].buffer.items, 0);
-
-        const prev_row = &self.rows.items[self.cursor.y - 1];
-        const remaining = try alloc.dupe(u8, prev_row.buffer.items[self.cursor.x..]);
-        for (self.cursor.x..prev_row.buffer.items.len) |_| {
-            const c = prev_row.buffer.pop();
-            if (c == null) break;
+    pub fn backspace(self: *Editor, alloc: std.mem.Allocator) !void {
+        if (self.mode == EditorMode.Normal) return;
+        if (self.cursor > self.buffer.items.len) {
+            self.cursor = @intCast(self.buffer.items.len);
         }
 
-        self.cursor.x = 0;
-        for (remaining) |c| {
-            try self.writeCharacter(alloc, c);
-        }
-        self.cursor.x = 0;
+        if (self.cursor == 0) return;
+
+        _ = self.buffer.orderedRemove(self.cursor - 1);
+        self.cursor -= 1;
+
+        try self.updateRows(alloc);
     }
 
     pub fn delete(self: *Editor, alloc: std.mem.Allocator) !void {
-        std.debug.assert(self.mode == EditorMode.Insert);
-        const row = &self.rows.items[self.cursor.y];
-
-        if (self.cursor.x == 0 and self.cursor.y > 0) {
-            const cx = self.rows.items[self.cursor.y - 1].buffer.items.len;
-            const remaining = try row.buffer.toOwnedSlice(alloc);
-            row.buffer.deinit(alloc);
-            _ = self.rows.orderedRemove(self.cursor.y);
-            self.moveCursorLeft();
-            for (remaining) |c| {
-                try self.write(alloc, c);
-            }
-            self.cursor.x = @intCast(cx);
-        } else if (self.cursor.x > 0) {
-            self.moveCursorLeft();
-            _ = row.buffer.orderedRemove(self.cursor.x);
+        if (self.mode == EditorMode.Normal) return;
+        if (self.cursor > self.buffer.items.len) {
+            self.cursor = @intCast(self.buffer.items.len);
         }
+
+        if (self.cursor == self.buffer.items.len) return;
+
+        _ = self.buffer.orderedRemove(self.cursor);
+        try self.updateRows(alloc);
     }
 
     /// Writes the character at the current cursor's position.
-    /// Advances the cursor's x coordinate by one.
-    pub fn writeCharacter(self: *Editor, alloc: std.mem.Allocator, character: u8) !void {
-        std.debug.assert(self.mode == EditorMode.Insert);
-        std.debug.assert(self.cursor.y < self.rows.items.len);
-        std.debug.assert(self.cursor.x <= self.rows.items[self.cursor.y].buffer.items.len);
-
-        const row = &self.rows.items[self.cursor.y];
-        try row.buffer.insert(alloc, self.cursor.x, character);
-        self.cursor.x += 1;
-    }
-
-    /// Writes the character at the current cursor's position.
-    /// May add a new row if the cursor is at the edge of the screen.
+    /// Increments the cursor's position by one.
     pub fn write(self: *Editor, alloc: std.mem.Allocator, character: u8) !void {
-        std.debug.assert(self.mode == EditorMode.Insert);
-        std.debug.assert(self.cursor.y < self.rows.items.len);
-        std.debug.assert(self.cursor.x <= self.rows.items[self.cursor.y].buffer.items.len);
-
-        if (self.cursor.x == self.terminal_cols - 1) {
-            try self.addRow(alloc);
+        if (self.mode == EditorMode.Normal) return;
+        if (self.cursor > self.buffer.items.len) {
+            self.cursor = @intCast(self.buffer.items.len);
         }
 
-        return try self.writeCharacter(alloc, character);
+        try self.buffer.insert(alloc, self.cursor, character);
+        self.cursor += 1;
+
+        try self.updateRows(alloc);
+    }
+
+    pub fn scroll(self: *Editor) void {
+        const cursor_row = self.getCursorPos().y + 1;
+        const page_end = self.row_offset + self.terminal_rows;
+
+        if (page_end - cursor_row <= 4) {
+            self.row_offset += 1;
+        } else if (cursor_row - self.row_offset == 4) {
+            self.row_offset = self.row_offset -| 1;
+        }
     }
 
     pub fn renderRows(self: *Editor) !void {
         try self.writer.writeAll("\x1b[K");
+        const cursor_position = self.getCursorPos();
 
-        for (0..self.rows.items.len) |idx| {
-            try self.writer.writeAll(self.rows.items[idx].buffer.items);
-            try self.writer.writeAll("\r\n");
-            try self.writer.writeAll("\x1b[K");
-        }
+        const rows_len: u16 = @intCast(self.rows.items.len);
+        const page_rows: u16 = std.math.clamp(self.row_offset + self.terminal_rows - 1, 0, rows_len);
+        for (self.row_offset..page_rows) |idx| {
+            const row = &self.rows.items[idx];
+            const buf = self.buffer.items[row.start..row.end];
 
-        const start: u8 = @intCast(self.rows.items.len);
-        const end: u8 = @intCast(self.terminal_rows);
-        for (start..end) |i| {
-            if (i < self.terminal_rows - 1) {
-                try self.writer.writeAll("~");
-                try self.writer.writeAll("\r\n");
+            if (row.end == self.buffer.items.len or self.buffer.items[row.end] == '\n') {
+                try self.writer.writeAll(buf);
+                try self.writer.writeAll("\r\n\x1b[K");
             } else {
-                const mode = switch (self.mode) {
-                    EditorMode.Insert => "---- INSERT ----",
-                    EditorMode.Normal => "---- NORMAL ----",
-                };
-                try self.writer.writeAll(mode);
+                try self.writer.writeAll(buf);
+                try self.writer.writeAll(self.buffer.items[row.end .. row.end + 1]);
+                try self.writer.writeAll("\x1b[K");
             }
-            // Clear the line after the current position.
-            try self.writer.writeAll("\x1b[K");
-        }
-    }
-
-    pub fn moveCursorLeft(self: *Editor) void {
-        if (self.cursor.x > 0) {
-            self.cursor.x -= 1;
-            return;
         }
 
-        if (self.cursor.y > 0) {
-            self.cursor.y -= 1;
-            self.cursor.x = @intCast(self.rows.items[self.cursor.y].buffer.items.len);
+        if ((page_rows - self.row_offset) < self.terminal_rows - 1) {
+            for ((page_rows - self.row_offset)..self.terminal_rows - 1) |_| {
+                try self.writer.writeAll("~\r\n\x1b[K");
+            }
         }
+
+        const mode = switch (self.mode) {
+            EditorMode.Insert => "[INSERT]",
+            EditorMode.Normal => "[NORMAL]",
+        };
+        try self.writer.print("{s} - {s} {d}/{d}:{d} \x1b[K", .{ mode, self.path, cursor_position.y + 1, self.rows.items.len, cursor_position.x + 1 });
     }
 };
 
@@ -609,11 +697,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     while (true) {
-        editor.refreshScreen() catch |err| {
+        editor.draw() catch |err| {
             std.debug.print("ERROR: Refreshing screen: {any}\r\n", .{err});
         };
 
-        editor.processKeypress(allocator) catch |err| switch (err) {
+        editor.processKeypress(init.io, allocator) catch |err| switch (err) {
             EditorError.ExitKeyPressed => {
                 _ = try editor.writer.write("\x1b[2J");
                 _ = try editor.writer.write("\x1b[H");
