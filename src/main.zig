@@ -1,39 +1,5 @@
 const std = @import("std");
-const win = @import("windows.zig");
-const windows = std.os.windows;
-
-// ------ WinAPI -----
-pub const CONSOLE_CHARACTER_ATTRIBUTES = packed struct(u16) {
-    FOREGROUND_BLUE: u1 = 0,
-    FOREGROUND_GREEN: u1 = 0,
-    FOREGROUND_RED: u1 = 0,
-    FOREGROUND_INTENSITY: u1 = 0,
-    BACKGROUND_BLUE: u1 = 0,
-    BACKGROUND_GREEN: u1 = 0,
-    BACKGROUND_RED: u1 = 0,
-    BACKGROUND_INTENSITY: u1 = 0,
-    COMMON_LVB_LEADING_BYTE: u1 = 0,
-    COMMON_LVB_TRAILING_BYTE: u1 = 0,
-    COMMON_LVB_GRID_HORIZONTAL: u1 = 0,
-    COMMON_LVB_GRID_LVERTICAL: u1 = 0,
-    COMMON_LVB_GRID_RVERTICAL: u1 = 0,
-    _13: u1 = 0,
-    COMMON_LVB_REVERSE_VIDEO: u1 = 0,
-    COMMON_LVB_UNDERSCORE: u1 = 0,
-};
-
-pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
-    dwSize: windows.COORD,
-    dwCursorPosition: windows.COORD,
-    wAttributes: CONSOLE_CHARACTER_ATTRIBUTES,
-    srWindow: SMALL_RECT,
-    dwMaximumWindowSize: windows.COORD,
-};
-
-pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
-pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
+const windows = @import("windows.zig");
 
 // ------ Global Variables -----
 var zilo_version: []const u8 = "0.0.2";
@@ -114,9 +80,9 @@ const Position = struct {
 /// Editor
 pub const Editor = struct {
     console: struct {
-        initial_input_mode: windows.DWORD = 0,
-        initial_output_mode: windows.DWORD = 0,
-        console_screen_buffer_info: CONSOLE_SCREEN_BUFFER_INFO = undefined,
+        initial_input_mode: windows.Dword = 0,
+        initial_output_mode: windows.Dword = 0,
+        console_screen_buffer_info: windows.ConsoleScreenBufferInfo = undefined,
     },
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -133,20 +99,20 @@ pub const Editor = struct {
         const stdin = std.Io.File.stdin();
         const stdout = std.Io.File.stdout();
 
-        var input_mode: windows.DWORD = 0;
-        if (GetConsoleMode(stdin.handle, &input_mode) == windows.BOOL.FALSE) {
+        var input_mode: windows.Dword = 0;
+        if (windows.GetConsoleMode(stdin.handle, &input_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to get console input mode - {d}\r\n", .{windows.GetLastError()});
             return error.EditorInitializationFailure;
         }
 
-        var output_mode: windows.DWORD = 0;
-        if (GetConsoleMode(stdout.handle, &output_mode) == windows.BOOL.FALSE) {
+        var output_mode: windows.Dword = 0;
+        if (windows.GetConsoleMode(stdout.handle, &output_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to get console output mode - {d}\r\n", .{windows.GetLastError()});
             return error.EditorInitializationFailure;
         }
 
-        var csbi: CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (GetConsoleScreenBufferInfo(stdout.handle, &csbi) == windows.BOOL.FALSE) {
+        var csbi: windows.ConsoleScreenBufferInfo = undefined;
+        if (windows.GetConsoleScreenBufferInfo(stdout.handle, &csbi) == windows.Bool.FALSE) {
             std.debug.print("Failed to get console screen buffer info - {d}\r\n", .{windows.GetLastError()});
             return error.EditorInitializationFailure;
         }
@@ -293,13 +259,13 @@ pub const Editor = struct {
         const stdout_handle = std.Io.File.stdout().handle;
 
         const input_mode = self.console.initial_input_mode & ~(enable_line_input | enable_echo_input | enable_processed_input);
-        if (SetConsoleMode(stdin_handle, input_mode) == windows.BOOL.FALSE) {
+        if (windows.SetConsoleMode(stdin_handle, input_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to set console input mode - {d}\r\n", .{windows.GetLastError()});
             return error.ErrorEnablingRawMode;
         }
 
         const output_mode = self.console.initial_output_mode | enable_virtual_terminal_processing | disable_newline_auto_return;
-        if (SetConsoleMode(stdout_handle, output_mode) == windows.BOOL.FALSE) {
+        if (windows.SetConsoleMode(stdout_handle, output_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to set console output mode - {d}\r\n", .{windows.GetLastError()});
             return error.ErrorEnablingRawMode;
         }
@@ -309,12 +275,12 @@ pub const Editor = struct {
         const stdin_handle = std.Io.File.stdin().handle;
         const stdout_handle = std.Io.File.stdout().handle;
 
-        if (SetConsoleMode(stdin_handle, self.console.initial_input_mode) == windows.BOOL.FALSE) {
+        if (windows.SetConsoleMode(stdin_handle, self.console.initial_input_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to set console input mode - {d}\r\n", .{windows.GetLastError()});
             return error.ErrorDisablingRawMode;
         }
 
-        if (SetConsoleMode(stdout_handle, self.console.initial_output_mode) == windows.BOOL.FALSE) {
+        if (windows.SetConsoleMode(stdout_handle, self.console.initial_output_mode) == windows.Bool.FALSE) {
             std.debug.print("Failed to set console output mode - {d}\r\n", .{windows.GetLastError()});
             return error.ErrorDisablingRawMode;
         }
@@ -323,7 +289,7 @@ pub const Editor = struct {
     pub fn readTimeout(self: *Editor, timeout: u32) !?u8 {
         const stdin_handle = std.Io.File.stdin().handle;
         const WAIT_OBJECT_0: u32 = 0;
-        if (WaitForSingleObject(stdin_handle, timeout) == WAIT_OBJECT_0) {
+        if (windows.WaitForSingleObject(stdin_handle, timeout) == WAIT_OBJECT_0) {
             return try self.reader.takeByte();
         }
         return null;
@@ -331,24 +297,24 @@ pub const Editor = struct {
 
     pub fn readInput(self: *Editor) !EditorInput {
         const stdin = std.Io.File.stdin();
-        var input: win.INPUT_RECORD = undefined;
-        var num_inputs_read: win.DWORD = 0;
+        var input: windows.InputRecord = undefined;
+        var num_inputs_read: windows.Dword = 0;
 
-        if (win.ReadConsoleInputA(stdin.handle, &input, 1, &num_inputs_read) == win.BOOL.FALSE) {
+        if (windows.ReadConsoleInputA(stdin.handle, &input, 1, &num_inputs_read) == windows.Bool.FALSE) {
             std.debug.print("ERROR: Unable to read console input: {d}\n", .{std.os.windows.GetLastError()});
             return error.ErrorConsoleInput;
         }
 
-        if (input.EventType == win.key_event) {
+        if (input.EventType == windows.key_event) {
             const event = input.Event.KeyEvent;
-            if (event.dwControlKeyState & win.left_ctrl_pressed != 0 or
-                event.dwControlKeyState & win.right_ctrl_pressed != 0)
+            if (event.dwControlKeyState & windows.left_ctrl_pressed != 0 or
+                event.dwControlKeyState & windows.right_ctrl_pressed != 0)
             {
                 switch (event.wVirtualKeyCode) {
-                    win.VirtualKey.KeyQ => {
+                    windows.VirtualKey.KeyQ => {
                         return .{ .key = EditorKey.Quit };
                     },
-                    win.VirtualKey.KeyS => {
+                    windows.VirtualKey.KeyS => {
                         return .{ .key = EditorKey.Save };
                     },
                     else => {
@@ -357,70 +323,70 @@ pub const Editor = struct {
                 }
             }
 
-            if (event.bKeyDown == win.BOOL.FALSE) {
+            if (event.bKeyDown == windows.Bool.FALSE) {
                 return .{ .key = EditorKey.Invalid };
             }
 
             switch (event.wVirtualKeyCode) {
                 // ------------ Movement --------------
-                win.VirtualKey.Home => {
+                windows.VirtualKey.Home => {
                     return .{ .key = EditorKey.Home };
                 },
-                win.VirtualKey.Left => {
+                windows.VirtualKey.Left => {
                     return .{ .key = EditorKey.ArrowLeft };
                 },
-                win.VirtualKey.Up => {
+                windows.VirtualKey.Up => {
                     return .{ .key = EditorKey.ArrowUp };
                 },
-                win.VirtualKey.Right => {
+                windows.VirtualKey.Right => {
                     return .{ .key = EditorKey.ArrowRight };
                 },
-                win.VirtualKey.Down => {
+                windows.VirtualKey.Down => {
                     return .{ .key = EditorKey.ArrowDown };
                 },
-                win.VirtualKey.KeyW => {
+                windows.VirtualKey.KeyW => {
                     const value = event.uChar.AsciiChar;
                     if (self.mode == EditorMode.Normal and std.ascii.isLower(value)) {
                         return .{ .key = EditorKey.ArrowUp };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.KeyD => {
+                windows.VirtualKey.KeyD => {
                     const value = event.uChar.AsciiChar;
                     if (self.mode == EditorMode.Normal and std.ascii.isLower(value)) {
                         return .{ .key = EditorKey.ArrowRight };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.KeyS => {
+                windows.VirtualKey.KeyS => {
                     const value = event.uChar.AsciiChar;
                     if (self.mode == EditorMode.Normal and std.ascii.isLower(value)) {
                         return .{ .key = EditorKey.ArrowDown };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.KeyA => {
+                windows.VirtualKey.KeyA => {
                     const value = event.uChar.AsciiChar;
                     if (self.mode == EditorMode.Normal and std.ascii.isLower(value)) {
                         return .{ .key = EditorKey.ArrowLeft };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.PageUp => {
+                windows.VirtualKey.PageUp => {
                     return .{ .key = EditorKey.PageUp };
                 },
-                win.VirtualKey.PageDown => {
+                windows.VirtualKey.PageDown => {
                     return .{ .key = EditorKey.PageDown };
                 },
 
                 // ------------ Mode Change --------------
-                win.VirtualKey.Escape => {
+                windows.VirtualKey.Escape => {
                     if (self.mode == EditorMode.Insert) {
                         return .{ .key = EditorKey.ModeChange };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.KeyI => {
+                windows.VirtualKey.KeyI => {
                     const value = event.uChar.AsciiChar;
                     if (self.mode == EditorMode.Normal and std.ascii.isLower(value)) {
                         return .{ .key = EditorKey.ModeChange };
@@ -429,32 +395,32 @@ pub const Editor = struct {
                 },
 
                 // ------------ Text --------------
-                win.VirtualKey.BackSpace => {
+                windows.VirtualKey.BackSpace => {
                     return .{ .key = EditorKey.Backspace };
                 },
-                win.VirtualKey.Delete => {
+                windows.VirtualKey.Delete => {
                     return .{ .key = EditorKey.Del };
                 },
-                win.VirtualKey.Tab => {
+                windows.VirtualKey.Tab => {
                     if (self.mode == EditorMode.Normal) {
                         return .{ .key = EditorKey.Invalid };
                     }
                     return .{ .key = EditorKey.Tab };
                 },
-                win.VirtualKey.Enter => {
+                windows.VirtualKey.Enter => {
                     if (self.mode == EditorMode.Insert) {
                         return .{ .key = EditorKey.Enter };
                     }
                     return .{ .value = event.uChar.AsciiChar };
                 },
-                win.VirtualKey.Space => {
+                windows.VirtualKey.Space => {
                     if (self.mode == EditorMode.Insert) {
                         return .{ .value = event.uChar.AsciiChar };
                     }
                     return .{ .key = EditorKey.Invalid };
                 },
 
-                win.VirtualKey.F2 => {
+                windows.VirtualKey.F2 => {
                     return .{ .key = EditorKey.Save };
                 },
 

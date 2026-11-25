@@ -1,6 +1,12 @@
 const std = @import("std");
 const windows = std.os.windows;
 
+pub const Dword = windows.DWORD;
+pub const Bool = windows.BOOL;
+pub const GetLastError = windows.GetLastError;
+pub const InputRecord = INPUT_RECORD;
+pub const ConsoleScreenBufferInfo = CONSOLE_SCREEN_BUFFER_INFO;
+
 pub const focus_event: u16 = 0x0010;
 pub const key_event: u16 = 0x0001;
 pub const menu_event: u16 = 0x0008;
@@ -70,10 +76,46 @@ pub extern "kernel32" fn ReadConsoleInputA(
     lpNumberOfEventsRead: *windows.DWORD,
 ) callconv(.winapi) windows.BOOL;
 
-pub const DWORD = windows.DWORD;
-pub const BOOL = windows.BOOL;
+pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOuput: windows.HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) windows.BOOL;
+pub extern "kernel32" fn WaitForSingleObject(hHandle: windows.HANDLE, dwMilliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
 
-pub const INPUT_RECORD = extern struct {
+const SMALL_RECT = extern struct {
+    Left: i16,
+    Top: i16,
+    Right: i16,
+    Bottom: i16,
+};
+
+const CONSOLE_CHARACTER_ATTRIBUTES = packed struct(u16) {
+    FOREGROUND_BLUE: u1 = 0,
+    FOREGROUND_GREEN: u1 = 0,
+    FOREGROUND_RED: u1 = 0,
+    FOREGROUND_INTENSITY: u1 = 0,
+    BACKGROUND_BLUE: u1 = 0,
+    BACKGROUND_GREEN: u1 = 0,
+    BACKGROUND_RED: u1 = 0,
+    BACKGROUND_INTENSITY: u1 = 0,
+    COMMON_LVB_LEADING_BYTE: u1 = 0,
+    COMMON_LVB_TRAILING_BYTE: u1 = 0,
+    COMMON_LVB_GRID_HORIZONTAL: u1 = 0,
+    COMMON_LVB_GRID_LVERTICAL: u1 = 0,
+    COMMON_LVB_GRID_RVERTICAL: u1 = 0,
+    _13: u1 = 0,
+    COMMON_LVB_REVERSE_VIDEO: u1 = 0,
+    COMMON_LVB_UNDERSCORE: u1 = 0,
+};
+
+const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+    dwSize: windows.COORD,
+    dwCursorPosition: windows.COORD,
+    wAttributes: CONSOLE_CHARACTER_ATTRIBUTES,
+    srWindow: SMALL_RECT,
+    dwMaximumWindowSize: windows.COORD,
+};
+
+const INPUT_RECORD = extern struct {
     EventType: u16,
     Event: extern union {
         KeyEvent: KEY_EVENT_RECORD,
@@ -84,7 +126,7 @@ pub const INPUT_RECORD = extern struct {
     },
 };
 
-pub const KEY_EVENT_RECORD = extern struct {
+const KEY_EVENT_RECORD = extern struct {
     bKeyDown: windows.BOOL,
     wRepeatCount: u16,
     wVirtualKeyCode: u16,
@@ -96,22 +138,21 @@ pub const KEY_EVENT_RECORD = extern struct {
     dwControlKeyState: u32,
 };
 
-pub const MENU_EVENT_RECORD = extern struct {
+const MENU_EVENT_RECORD = extern struct {
     dwCommandId: u32,
 };
 
-pub const MOUSE_EVENT_RECORD = extern struct {
+const MOUSE_EVENT_RECORD = extern struct {
     dwMousePosition: windows.COORD,
     dwButtonState: u32,
     dwControlKeyState: u32,
     dwEventFlags: u32,
 };
 
-pub const FOCUS_EVENT_RECORD = extern struct {
+const FOCUS_EVENT_RECORD = extern struct {
     bSetFocus: windows.BOOL,
 };
 
-pub const WINDOW_BUFFER_SIZE_RECORD = extern struct {
+const WINDOW_BUFFER_SIZE_RECORD = extern struct {
     dwSize: windows.COORD,
 };
-
